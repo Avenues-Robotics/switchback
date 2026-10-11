@@ -1,0 +1,302 @@
+rules_version = '2';
+
+// Security rules for the data model in docs/data-model.md. Tested in tests/rules/ against the Firestore emulator:
+// run `npm run test:rules` after any change here.
+//
+// Roles: student, lead (students), mentor (adult, scoped to teamIds), coach (program-wide, teamIds = []).
+// The setup script, the email sender, and the GitHub sync run with the project owner's access, which bypasses
+// these rules.
+//
+// How to read this file
+// ---------------------
+// The browser talks to the database directly, so these rules are the only real lock: the app hiding a button
+// protects nothing. Each `match` names a kind of document by its path, and each `allow` says when an action on it
+// is permitted. Anything not allowed here is refused.
+//
+//   read   = get one document, or list several      create = make a new document
+//   update = change an existing document            delete = remove it
+//
+// Three names appear everywhere:
+//
+//   request.auth           who is asking (null if signed out); request.auth.uid is their id
+//   resource.data          the document as it is stored now
+//   request.resource.data  the document as it would be if this write went through
+//
+// So an `update` rule usually checks both: who may change the old document, and that the new one is still valid.
+// (A rule that checks only one of them is how privacy holes happen.)
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Someone is signed in.
+    function signedIn() { return request.auth != null; }
+    // The id of whoever is asking.
+    function uid() { return request.auth.uid; }
+    // The names of the fields an update would change. `changed().hasOnly(['a', 'b'])` means "nothing but a and b".
+    function changed() { return request.resource.data.diff(resource.data).affectedKeys(); }
+
+    // Which program a person belongs to. Written once, in the same batch as their invite claim.
+    match /users/{userId} {
+      allow read: if signedIn() && userId == uid();
+      allow create: if signedIn() && userId == uid()
+        && request.resource.data.keys().hasOnly(['programId'])
+        && existsAfter(/databases/$(database)/documents/programs/$(request.resource.data.programId)/members/$(uid()));
+    }
+
+    // Invites are found by email at first sign-in, before the person knows their program.
+    match /{path=**}/invites/{email} {
+      allow read: if signedIn() && request.auth.token.email_verified == true
+        && resource.data.email == request.auth.token.email.lower();
+    }
+
+    match /programs/{programId} {
+
+      // ---------- helpers ----------
+      // Where this program and its members are stored.
+      function programPath() { return /databases/$(database)/documents/programs/$(programId); }
+      function memberPath(id) { return /databases/$(database)/documents/programs/$(programId)/members/$(id); }
+      // The asker's own member record: their role and their teams. Everything below is built on this, and it is
+      // read from the database, never taken from what the browser claims.
+      function me() { return get(memberPath(uid())).data; }
+      // In this program at all.
+      function isMember() { return signedIn() && exists(memberPath(uid())); }
+      // A program coach: an adult who works across every team.
+      function isCoach() { return isMember() && me().role == 'coach'; }
+      // A program coach or a team mentor.
+      function isAdult() { return isMember() && me().role in ['coach', 'mentor']; }
+      // May see this team's work: anyone on the team, or a program coach.
+      function onTeam(teamId) { return isMember() && (me().role == 'coach' || teamId in me().teamIds); }
+      // An adult responsible for this team: its mentor, or a program coach.
+      function adultOn(teamId) { return isMember() && (me().role == 'coach' || (me().role == 'mentor' && teamId in me().teamIds)); }
+      // May run this team: its team lead, or an adult responsible for it.
+      function leadOn(teamId) { return onTeam(teamId) && (me().role == 'lead' || adultOn(teamId)); }
+      // Mentors manage students and leads whose teams are all among the mentor's teams.
+      function mentorCanManage(teamIds, role) {
+        return isMember() && me().role == 'mentor' && role in ['student', 'lead'] && teamIds.toSet().difference(me().teamIds.toSet()).size() == 0;
+      }
+      // Sign-in method check (from program.config.json). Emails on the program's Google domains must use Google;
+      // other emails may use email/password only if the program allows it for this person's role.
+      // Whether an email's domain is one the program signs in to with Google.
+      function onGoogleDomain(auth, domain) { return 'google' in auth && domain in auth.google.domains; }
+      // Whether the asker signed in the way the program requires for someone in this role.
+      function signInAllowed(role) {
+        let auth = get(programPath()).data.auth;
+        let domain = request.auth.token.email.lower().split('@')[1];
+        let provider = request.auth.token.firebase.sign_in_provider;
+        return request.auth.token.email_verified == true && (
+          (provider == 'google.com' && onGoogleDomain(auth, domain))
+          || (provider == 'password' && !onGoogleDomain(auth, domain)
+              && 'password' in auth && role in auth.password.roles));
+      }
+
+      allow read: if isMember();
+      allow update: if isCoach();
+
+      // The sign-in page reads this before anyone has signed in: the program's name and sign-in methods only.
+      match /public/{docId} {
+        allow read: if true;
+        allow write: if isCoach();
+      }
+
+      // ---------- people ----------
+      match /members/{memberId} {
+        // A new member record must copy its invite exactly, so nobody can give themselves a different role or team.
+        function inviteMatches(invite) {
+          return request.resource.data.keys().hasOnly(['displayName', 'role', 'teamIds', 'subteams', 'joinedAt'])
+            && request.resource.data.displayName == invite.displayName
+            && request.resource.data.role == invite.role
+            && request.resource.data.teamIds == invite.teamIds
+            && request.resource.data.subteams == invite.subteams
+            && request.resource.data.joinedAt == request.time;
+        }
+        allow read: if isMember();
+        // Claiming an invite: the new member doc must match the invite exactly.
+        allow create: if signedIn() && memberId == uid()
+          && signInAllowed(request.resource.data.role)
+          && inviteMatches(get(/databases/$(database)/documents/programs/$(programId)/invites/$(request.auth.token.email.lower())).data);
+        allow update: if memberId != uid() && (
+            isCoach()
+            || (mentorCanManage(resource.data.teamIds, resource.data.role) && mentorCanManage(request.resource.data.teamIds, request.resource.data.role))
+            // Team leads change subteam assignments only.
+            || (isMember() && me().role == 'lead' && changed().hasOnly(['subteams'])
+                && resource.data.teamIds.hasAny(me().teamIds)));
+        allow delete: if memberId != uid() && (isCoach() || mentorCanManage(resource.data.teamIds, resource.data.role));
+
+        match /private/{docId} {
+          allow read, write: if isCoach();
+        }
+      }
+
+      match /invites/{email} {
+        allow read: if isCoach() || (isAdult() && resource.data.teamIds.hasAny(me().teamIds));
+        allow create: if email == request.resource.data.email
+          && (isCoach() || mentorCanManage(request.resource.data.teamIds, request.resource.data.role));
+        // Editing checks the invite before and after, so a mentor can't pull another team's invite onto theirs.
+        allow update: if email == request.resource.data.email
+          && (isCoach() || (mentorCanManage(resource.data.teamIds, resource.data.role)
+                            && mentorCanManage(request.resource.data.teamIds, request.resource.data.role)));
+        // Coaches/mentors cancel invites; the invited person deletes theirs when claiming it.
+        allow delete: if isCoach() || mentorCanManage(resource.data.teamIds, resource.data.role)
+          || (signedIn() && email == request.auth.token.email.lower());
+      }
+
+      match /seasons/{seasonId} {
+        allow read: if isMember();
+        allow write: if isCoach();
+      }
+
+      // ---------- teams ----------
+      match /teams/{teamId} {
+        allow read: if onTeam(teamId);
+        // Mentors and team leads edit their team's name, number, color, subteams, and GitHub settings (leads nothing else);
+        // only program coaches change its seasons.
+        allow update: if isCoach() || (adultOn(teamId) && !changed().hasAny(['seasonIds']))
+          || (leadOn(teamId) && changed().hasOnly(['name', 'number', 'color', 'subteams', 'github']));
+        allow create, delete: if isCoach();
+
+        match /sprints/{sprintId} {
+          allow read: if onTeam(teamId);
+          // Planning (dates, objective text) is for leads and adults; they also mark objectives met.
+          allow write: if leadOn(teamId);
+        }
+
+        match /tasks/{taskId} {
+          // What every task must look like, on the way in and after any change.
+          function validTask(task) {
+            return task.title is string && task.title.size() > 0 && task.title.size() <= 90
+              && task.status in ['To do', 'In progress', 'Done']
+              && task.type in ['Task', 'Learning', 'Idea', 'GitHub issue']
+              && task.assigneeIds is list && task.subteamIds is list && task.subtasks is list
+              && task.rank is string;
+          }
+          allow read: if onTeam(teamId);
+          // Only the GitHub sync (Admin SDK) creates issues; users can't set or change that type.
+          allow create: if onTeam(teamId) && validTask(request.resource.data)
+            && request.resource.data.type != 'GitHub issue'
+            && request.resource.data.createdBy == uid();
+          allow update: if onTeam(teamId) && validTask(request.resource.data)
+            && (resource.data.type == 'GitHub issue') == (request.resource.data.type == 'GitHub issue')
+            && !changed().hasAny(['createdBy', 'createdAt', 'github']);
+          // Hard delete: adults only, and only after the task was archived.
+          allow delete: if adultOn(teamId) && resource.data.archived != null;
+
+          match /comments/{commentId} {
+            allow read: if onTeam(teamId);
+            allow create: if onTeam(teamId) && request.resource.data.authorId == uid()
+              && request.resource.data.text is string && request.resource.data.text.size() <= 2000;
+            allow update: if onTeam(teamId) && resource.data.authorId == uid() && changed().hasOnly(['text']);
+            allow delete: if resource.data.authorId == uid() || adultOn(teamId);
+          }
+        }
+
+        match /events/{eventId} {
+          allow read: if onTeam(teamId);
+          allow write: if onTeam(teamId);
+        }
+
+        match /pages/{pageId} {
+          allow read: if onTeam(teamId);
+          allow write: if onTeam(teamId);
+        }
+      }
+
+      // ---------- program-wide content ----------
+      match /events/{eventId} {
+        allow read: if isMember();
+        allow write: if isCoach();
+      }
+
+      match /announcements/{announcementId} {
+        // Coaches post anywhere ("all" = program-wide); everyone else only to their own teams.
+        function canPostTo(audience) {
+          return isCoach() || (!('all' in audience) && audience.toSet().difference(me().teamIds.toSet()).size() == 0);
+        }
+        allow read: if isCoach() || (isMember() && ('all' in resource.data.audience || resource.data.audience.hasAny(me().teamIds)));
+        allow create: if isMember() && request.resource.data.authorId == uid() && canPostTo(request.resource.data.audience);
+        // Edits pass the same audience check, so an author can't re-target a post to other teams.
+        allow update: if isCoach() || (isMember() && resource.data.authorId == uid()
+          && request.resource.data.authorId == uid() && canPostTo(request.resource.data.audience));
+        allow delete: if isCoach() || (isMember() && resource.data.authorId == uid());
+      }
+
+      match /huddles/{huddleId} {
+        allow read: if isAdult();
+        allow create, delete: if isCoach();
+        allow update: if isCoach()
+          // Any adult can mark a huddle seen: add nothing but their own UID to readBy (again is harmless).
+          || (isAdult() && changed().hasOnly(['readBy'])
+              && resource.data.readBy.toSet().difference(request.resource.data.readBy.toSet()).size() == 0
+              && request.resource.data.readBy.toSet().difference(resource.data.readBy.toSet()).hasOnly([uid()]));
+      }
+
+      // ---------- outbox (email) ----------
+      // A post waiting to be emailed. It names the post and nothing else; the sender (scripts/email, run by the
+      // project's owner outside these rules) works out who gets it and marks it sent. Clients can only add one, as
+      // "pending", for a post they are creating in the same write, so nobody can email someone else's post, email
+      // one twice, or change what happened to it.
+      match /outbox/{itemId} {
+        function announcementPath(id) { return /databases/$(database)/documents/programs/$(programId)/announcements/$(id); }
+        function huddlePath(id) { return /databases/$(database)/documents/programs/$(programId)/huddles/$(id); }
+        function ownNewPost(item) {
+          return (item.kind == 'announcement' && !exists(announcementPath(item.sourceId))
+                  && getAfter(announcementPath(item.sourceId)).data.authorId == uid()
+                  && getAfter(announcementPath(item.sourceId)).data.emailed == true)
+              || (item.kind == 'huddle' && !exists(huddlePath(item.sourceId))
+                  && getAfter(huddlePath(item.sourceId)).data.authorId == uid());
+        }
+        allow read: if isCoach();
+        allow create: if isMember()
+          && request.resource.data.keys().hasOnly(['kind', 'sourceId', 'createdBy', 'createdAt', 'state'])
+          && request.resource.data.createdBy == uid()
+          && request.resource.data.state == 'pending'
+          && itemId == request.resource.data.kind + '-' + request.resource.data.sourceId
+          && ownNewPost(request.resource.data);
+      }
+
+      // ---------- goals ----------
+      // Teammates see only the statement and status (this doc). The rest of the goal is in goals/{goalId}.
+      match /goalSummaries/{goalId} {
+        // The private goal as it will be once this write finishes. A summary is always written in the same batch as
+        // its goal, and must agree with it.
+        function goalAfter() { return getAfter(/databases/$(database)/documents/programs/$(programId)/goals/$(goalId)).data; }
+        allow read: if onTeam(resource.data.teamId);
+        // Written with the goal (same batch). Its team always matches the goal's, so it's shown only to that team.
+        allow create, update: if (isMember() && request.resource.data.studentId == uid()
+            && goalAfter().studentId == uid() && request.resource.data.teamId == goalAfter().teamId)
+          || isCoach();
+        allow delete: if (isMember() && resource.data.studentId == uid()) || isCoach();
+      }
+
+      match /goals/{goalId} {
+        // The full goal is for the student and the adults of their current team. Teammates get the summary only.
+        function canSeeGoal(goal) { return goal.studentId == uid() || adultOn(goal.teamId); }
+        allow read: if isMember() && canSeeGoal(resource.data);
+        allow create: if isMember() && request.resource.data.studentId == uid() && request.resource.data.teamId in me().teamIds;
+        allow update: if isMember() && (
+            (resource.data.studentId == uid() && request.resource.data.studentId == uid() && !changed().hasAny(['teamId']))
+            // Adults only touch the unread-feedback counter (when posting feedback); coaches also move goals between teams.
+            || (adultOn(resource.data.teamId) && changed().hasOnly(['unreadFeedback', 'lastFeedbackAt']))
+            || isCoach());
+        allow delete: if isCoach();
+
+        match /events/{eventId} {
+          // The goal this history entry belongs to, as stored now.
+          function goal() { return get(/databases/$(database)/documents/programs/$(programId)/goals/$(goalId)).data; }
+          // Mentors see only events written while the student was on one of their teams.
+          allow read: if isMember() && (goal().studentId == uid() || isCoach() || (adultOn(resource.data.teamId) && adultOn(goal().teamId)));
+          // getAfter: an event can be written in the same batch as its goal (a new goal and its "created" event).
+          function goalAfter() { return getAfter(/databases/$(database)/documents/programs/$(programId)/goals/$(goalId)).data; }
+          allow create: if isMember() && request.resource.data.authorId == uid() && (
+              (goalAfter().studentId == uid() && request.resource.data.type in ['created', 'checkin', 'reply', 'paused', 'resumed', 'completed', 'changed', 'edit'])
+              || (adultOn(goalAfter().teamId) && request.resource.data.type == 'feedback' && request.resource.data.teamId == goalAfter().teamId));
+          allow update: if false;   // history is append-only
+          allow delete: if isCoach();
+        }
+      }
+
+      match /userState/{userId} {
+        allow read, write: if isMember() && userId == uid();
+      }
+    }
+  }
+}

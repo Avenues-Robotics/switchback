@@ -1,0 +1,18 @@
+// Where the app starts: creates the Vue app, gives it the shared stores (Pinia) and the router, loads the styles
+// every page uses, and puts it on the page (the #app element in index.html).
+import { createApp } from 'vue'
+import { createPinia } from 'pinia'
+
+import App from './App.vue'
+import router from './router'
+import './styles/base.css'
+import './styles/tables.css'
+import './styles/goals.css'
+import './components/settings/settings.css'
+
+const app = createApp(App)
+
+app.use(createPinia())
+app.use(router)
+
+app.mount('#app')
