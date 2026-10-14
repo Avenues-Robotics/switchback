@@ -10,6 +10,7 @@ service-account*.json
 
 # Firebase
 .firebase/
+.firebaserc
 firebase-debug.log*
 firestore-debug.log*
 ui-debug.log*
