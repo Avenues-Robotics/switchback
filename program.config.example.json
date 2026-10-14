@@ -1,0 +1,40 @@
+{
+  "program": {
+    "id": "example-team",
+    "name": "Example Team"
+  },
+  "signIn": {
+    "google": { "allowedDomains": ["example.com"] },
+    "password": { "roles": ["mentor", "coach"] }
+  },
+  "firstCoach": {
+    "displayName": "Mr. Coach",
+    "email": "coach@example.com"
+  },
+  "season": {
+    "id": "2026-27",
+    "name": "2026–27",
+    "start": "2026-09-01",
+    "end": "2027-06-15"
+  },
+  "subteamDefaults": [
+    {
+      "name": "Mechanical",
+      "color": "red",
+      "description": "Design, CAD, fabrication, and maintenance"
+    },
+    { "name": "Software", "color": "green", "description": "Tele-op, autonomous, and wiring" },
+    { "name": "Outreach", "color": "purple", "description": "Reach and Connect" },
+    {
+      "name": "Competition Ops",
+      "color": "blue",
+      "description": "Pit, judges' interview, scouting, packing, and logistics"
+    },
+    {
+      "name": "Drive Team",
+      "color": "teal",
+      "description": "Driving, strategy, and alliance coordination"
+    }
+  ],
+  "teams": [{ "name": "Circuit Breakers", "number": "418", "color": "green", "sprintDays": 14 }]
+}
