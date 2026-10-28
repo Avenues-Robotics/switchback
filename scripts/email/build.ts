@@ -8,6 +8,7 @@ const ENTRY_POINTS = [
   'install',
   'uninstall',
   'sendTestEmail',
+  'listAliases',
   'syncIssues',
   'installGithub',
   'uninstallGithub',

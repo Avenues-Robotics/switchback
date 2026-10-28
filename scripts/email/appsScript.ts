@@ -1,7 +1,8 @@
 // The Apps Script side of the two background jobs a program can install: the email sender (docs/email.md) and the
 // GitHub sync (docs/github.md). Settings come from Script properties, network goes through UrlFetchApp, mail
-// through MailApp (the Gmail account of whoever installs it), and each job has its own time trigger. `npm run
-// build:email` bundles this into dist-email/Code.gs. Install either job or both.
+// through the Gmail account of whoever installs it (MailApp, or GmailApp when FROM_ADDRESS names a "Send mail as"
+// alias), and each job has its own time trigger. `npm run build:email` bundles this into dist-email/Code.gs.
+// Install either job or both.
 import { processOutbox, type Io } from './outbox'
 import { createStore, GOOGLE_HOSTS, type Request } from './rest'
 import { syncGithub, type GithubIo } from '../github/sync'
@@ -9,6 +10,7 @@ import { syncGithub, type GithubIo } from '../github/sync'
 /* eslint-disable @typescript-eslint/no-explicit-any */
 declare const UrlFetchApp: any
 declare const MailApp: any
+declare const GmailApp: any
 declare const ScriptApp: any
 declare const PropertiesService: any
 declare const LockService: any
@@ -37,6 +39,21 @@ function settings() {
   }
 }
 
+// The "Send mail as" alias to send from (FROM_ADDRESS), or null to send from the account's own address. An alias
+// helps when the account's own address fails DMARC but an alias on a Google-hosted domain doesn't. Throws, in
+// plain words, if the account can't send as it, rather than letting Gmail quietly fall back to the main address.
+function fromAddress(): string | null {
+  const from = (PropertiesService.getScriptProperties().getProperty('FROM_ADDRESS') ?? '').trim()
+  if (!from) return null
+  const aliases: string[] = GmailApp.getAliases()
+  if (!aliases.some((alias) => alias.toLowerCase() === from.toLowerCase()))
+    throw new Error(
+      `FROM_ADDRESS ${from} isn't a "Send mail as" address on this account (Gmail → Settings → Accounts). ` +
+        `It can send as: ${aliases.join(', ') || 'no aliases'}. Run listAliases to check.`,
+    )
+  return from
+}
+
 // How the script talks to Google's APIs: as whoever installed it, using their sign-in. That is what lets it
 // read the database without going through the app's security rules.
 const request: Request = (method, url, body) => {
@@ -58,16 +75,29 @@ const request: Request = (method, url, body) => {
 }
 
 const io: Io = {
-  sendMail: ({ bcc, subject, text, html, fromName }) =>
-    MailApp.sendEmail({
-      // Gmail needs a "to"; everyone real is blind-copied.
-      to: Session.getEffectiveUser().getEmail(),
-      bcc: bcc.join(','),
-      subject,
-      body: text,
-      htmlBody: html,
-      name: fromName,
-    }),
+  // Sends from the alias through GmailApp when FROM_ADDRESS is set, otherwise through MailApp. Gmail needs a
+  // "to", so it's the sending account; everyone real is blind-copied.
+  sendMail: ({ bcc, subject, text, html, fromName }) => {
+    const to = Session.getEffectiveUser().getEmail()
+    const from = fromAddress()
+    if (from)
+      GmailApp.sendEmail(to, subject, text, {
+        bcc: bcc.join(','),
+        htmlBody: html,
+        name: fromName,
+        from,
+      })
+    else
+      MailApp.sendEmail({
+        to,
+        bcc: bcc.join(','),
+        subject,
+        body: text,
+        htmlBody: html,
+        name: fromName,
+      })
+  },
+  // MailApp reports the daily limit that GmailApp shares, so this is right either way.
   quota: () => MailApp.getRemainingDailyQuota(),
   log: (message) => console.log(message),
 }
@@ -99,6 +129,7 @@ export function sendPending() {
 /** Run once: checks the settings, starts the every-minute trigger, and tells the app that email is on. */
 export function install() {
   const current = settings()
+  const from = fromAddress()
   const program = store().get('')
   if (!program)
     throw new Error(`Can't find the program "${current.programId}" in ${current.projectId}.`)
@@ -112,7 +143,7 @@ export function install() {
         : current.includeStudents
           ? 'Announcements go to students, mentors, and coaches.'
           : 'Announcements go to mentors and coaches only (INCLUDE_STUDENTS is not "true").'
-    }`,
+    } Mail comes from ${from ?? Session.getEffectiveUser().getEmail()}.`,
   )
 }
 
@@ -145,6 +176,12 @@ export function sendTestEmail() {
     html: `<p>This is a test from the Switchback email sender.</p><p><a href="${current.appUrl}">Open the app</a></p>`,
   })
   console.log(`Sent to ${to}. ${io.quota()} recipients left today.`)
+}
+
+/** Logs the "Send mail as" aliases this account can use for FROM_ADDRESS (Gmail doesn't list the main address). */
+export function listAliases() {
+  const aliases: string[] = GmailApp.getAliases()
+  console.log(aliases.length ? aliases.join(', ') : 'No "Send mail as" aliases on this account.')
 }
 
 // ---------- GitHub sync ----------

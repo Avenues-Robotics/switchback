@@ -17,6 +17,9 @@ From the Google account that will run the script, send an ordinary email to an a
   Google accounts are used for sign-in and Drive but mail is on Microsoft 365. The sender can't deliver from that
   account until your IT team authorizes Google to send for the domain (adding Google to the domain's SPF record and
   turning on DKIM for Google Workspace). Ask them before installing anything below.
+- **It bounces, but the account has a "Send mail as" alias on a domain whose mail Google does host** (Gmail →
+  Settings → Accounts): send the same test from that alias. If it arrives, install the sender below and set
+  `FROM_ADDRESS` to the alias.
 
 ## What gets sent, and to whom
 
@@ -69,10 +72,11 @@ build the script.
    | `APP_URL` | Where your app lives, e.g. `https://your-project.web.app` |
    | `TEST_REDIRECT` | *(while testing)* An address of yours other than the sending account: every email goes there instead of to real people |
    | `INCLUDE_STUDENTS` | `true` to email students too; leave it out to email mentors and coaches only |
+   | `FROM_ADDRESS` | *(optional)* A "Send mail as" alias of the sending account to send from instead of its own address. Run `listAliases` to see which ones it can use |
 
 6. **Check mail works.** In the editor, pick the function `sendTestEmail` and click Run. Approve the permissions it
-   asks for. One email goes to `TEST_REDIRECT` if you set it, otherwise to you. Use an address other than the sending
-   account for this: Gmail often doesn't show mail you send to yourself in the inbox (look in Sent or All Mail).
+   asks for (they include reading and sending Gmail, which sending from an alias needs). One email goes to
+   `TEST_REDIRECT` if you set it, otherwise to you. Use an address other than the sending account for this: Gmail often doesn't show mail you send to yourself in the inbox (look in Sent or All Mail).
 7. **Turn it on.** Run `install`. It starts a trigger that runs `sendPending` every minute, and tells the app that
    email is on: "Also send by email" appears on new announcements, and huddles say they'll be emailed.
 
@@ -98,7 +102,8 @@ Run `uninstall`. It removes the trigger and tells the app that email is off. Pos
   reaching only some people.
 - Up to a minute or two passes between posting and sending. Each check that finds nothing costs one Firestore read
   (about 1,440 a day, well inside the free plan's 50,000).
-- Mail comes from the account that installed the script, shown under your program's name. Replies go to that account.
+- Mail comes from the account that installed the script, or from `FROM_ADDRESS` if it's set, shown under your
+  program's name. Replies go to that address.
 
 ## Changing the sender
 

@@ -179,7 +179,8 @@ written in TypeScript here so they can be tested; all IO is synchronous, like Ap
 - **Email** (`scripts/email/`, `docs/email.md`): a post writes `outbox/{kind}-{sourceId}` in the same batch (no
   addresses, no text). The sender claims each item with an "only if unchanged" commit, reads addresses from Firebase
   Authentication, blind-copies, and sends plain text. Students are emailed only with `INCLUDE_STUDENTS=true`. It
-  can't deliver when the organization's mail isn't hosted by Google (DMARC); the doc opens with that check.
+  can't deliver when the organization's mail isn't hosted by Google (DMARC); the doc opens with that check. An
+  optional `FROM_ADDRESS` script property sends through GmailApp from a "Send mail as" alias instead.
 - **GitHub sync** (`scripts/github/`, `docs/github.md`): one way, GitHub → Switchback. Copies title (cut to the
   rules' 90-character limit), number, link, state, and the description as plain text. Never authors, assignees,
   labels, or comments: GitHub requires users to be 13+, and no profiles should reach the database.
